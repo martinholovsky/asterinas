@@ -125,10 +125,10 @@ log_step "1.4 Enter user directory"
 cd "$CGROUP_NAME"
 echo "Current directory: $(pwd)"
 
-log_step "1.5 Check initial memory.max in child"
-verify "memory.max doesn't exist initially" \
-    "ls memory.max" \
-    "ls: memory.max: No such file or directory"
+log_step "1.5 Check initial memory interface files in child"
+verify "memory.current doesn't exist initially" \
+    "ls memory.current" \
+    "ls: memory.current: No such file or directory"
 verify "cpu.stat exists initially in child" \
     "ls cpu.stat" \
     "cpu.stat"
@@ -182,9 +182,9 @@ verify "cpu.weight now exists" \
 verify "cpu.max now exists" \
     "ls cpu.max" \
     "cpu.max"
-verify "memory.max now exists" \
-    "ls memory.max" \
-    "memory.max"
+verify "memory.current now exists" \
+    "ls memory.current" \
+    "memory.current"
 verify "pids.max now exists" \
     "ls pids.max" \
     "pids.max"
@@ -312,11 +312,11 @@ verify "root subtree_control removed memory" \
     "cat cgroup.subtree_control" \
     "cpu pids"
 
-log_step "2.5 Check child lost memory.max after deactivation"
+log_step "2.5 Check child lost memory interface files after deactivation"
 cd "$CGROUP_NAME"
-verify "memory.max removed after disabling" \
-    "ls memory.max" \
-    "ls: memory.max: No such file or directory"
+verify "memory.current removed after disabling" \
+    "ls memory.current" \
+    "ls: memory.current: No such file or directory"
 
 # --- Section 3: Process membership --------------------------------------------
 
@@ -604,6 +604,116 @@ if [ "$PEAK_AFTER" -lt "$PEAK_DURING" ]; then
 else
     echo -e "Verified: pids.peak retained"
 fi
+
+# --- Section 4.4: memory sub-controller ---------------------------------------
+
+log_section "Section 4.4: memory sub-controller"
+
+log_step "4.4.1 Re-enable memory in root"
+echo "+memory" > "$CGROUP_ROOT/cgroup.subtree_control"
+verify "memory.current exists again" \
+    "ls $CGROUP_ROOT/$CGROUP_NAME/memory.current" \
+    "$CGROUP_ROOT/$CGROUP_NAME/memory.current"
+
+log_step "4.4.2 memory.max is absent until it is enforced"
+# Accounting landed before enforcement. `memory.max` is added by the change that makes
+# it actually cap a workload, so that a runtime probing for it is not misled.
+verify "memory.max does not exist" \
+    "ls $CGROUP_ROOT/$CGROUP_NAME/memory.max" \
+    "ls: $CGROUP_ROOT/$CGROUP_NAME/memory.max: No such file or directory"
+
+log_step "4.4.3 memory.stat reports the anon category"
+verify "memory.stat has an anon line" \
+    "grep -c '^anon ' $CGROUP_ROOT/$CGROUP_NAME/memory.stat" \
+    "1"
+
+log_step "4.4.4 Verify memory.current grows for a process allocating in the cgroup"
+# The VMAR's charge target is fixed when the VMAR is created, so the helper must join the
+# cgroup and *then* exec, which is what a container runtime does. A process that merely
+# migrates keeps charging its original cgroup.
+MEM_RESULT=$(mktemp)
+MEM_HELPER=$(mktemp)
+
+cat > "$MEM_HELPER" << 'EOF'
+#!/bin/sh
+CGROUP_PATH="$1"
+RESULT_FILE="$2"
+
+# Join the cgroup, then exec so that a fresh VMAR is built against it.
+echo $$ > "$CGROUP_PATH/cgroup.procs"
+exec sh -c '
+    CGROUP_PATH="$1"
+    RESULT_FILE="$2"
+
+    read BEFORE < "$CGROUP_PATH/memory.current"
+
+    # Touch a few MiB of anonymous memory. Building the string in the shell keeps the
+    # pages resident and needs no helper binary.
+    BLOB=x
+    i=0
+    while [ $i -lt 20 ]; do
+        BLOB="$BLOB$BLOB"
+        i=$((i + 1))
+    done
+
+    read AFTER < "$CGROUP_PATH/memory.current"
+    read PEAK < "$CGROUP_PATH/memory.peak"
+
+    echo "$BEFORE $AFTER $PEAK ${#BLOB}" > "$RESULT_FILE"
+' sh "$CGROUP_PATH" "$RESULT_FILE"
+EOF
+
+chmod +x "$MEM_HELPER"
+sh "$MEM_HELPER" "$CGROUP_ROOT/$CGROUP_NAME" "$MEM_RESULT" 2>/dev/null || true
+
+# `set -e` is active and `read` fails on an empty file, so guard it and report below.
+read MEM_BEFORE MEM_AFTER MEM_PEAK BLOB_LEN < "$MEM_RESULT" || true
+rm -f "$MEM_RESULT" "$MEM_HELPER"
+
+echo "memory.current before: $MEM_BEFORE"
+echo "memory.current after:  $MEM_AFTER"
+echo "memory.peak:           $MEM_PEAK"
+echo "bytes allocated:       $BLOB_LEN"
+
+if [ -z "$MEM_AFTER" ]; then
+    echo "Error: helper did not report memory.current"
+    exit 1
+fi
+
+# The charge must actually move. If accounting were a no-op both reads would be equal,
+# which is the failure this check exists to catch.
+if [ "$MEM_AFTER" -le "$MEM_BEFORE" ]; then
+    echo "Error: memory.current did not grow while the cgroup allocated $BLOB_LEN bytes"
+    exit 1
+fi
+
+if [ "$MEM_PEAK" -lt "$MEM_AFTER" ]; then
+    echo "Error: memory.peak ($MEM_PEAK) is below memory.current ($MEM_AFTER)"
+    exit 1
+fi
+
+echo "Verified: memory.current tracked the allocation"
+
+log_step "4.4.5 Verify memory.current falls back after the process exits"
+# The helper has exited, so its VMAR was torn down and its charge released.
+sleep 0.2
+read MEM_FINAL < "$CGROUP_ROOT/$CGROUP_NAME/memory.current" || true
+echo "memory.current after helper exit: $MEM_FINAL"
+
+if [ "$MEM_FINAL" -ge "$MEM_AFTER" ]; then
+    echo "Error: memory.current ($MEM_FINAL) did not fall after the process exited;"
+    echo "       the charge leaked."
+    exit 1
+fi
+
+echo "Verified: the charge was released on exit"
+
+log_step "4.4.6 Verify memory.peak is retained after the charge is released"
+if [ "$MEM_PEAK" -lt "$MEM_AFTER" ]; then
+    echo "Error: memory.peak did not retain the high-water mark"
+    exit 1
+fi
+echo "Verified: memory.peak retained"
 
 # --- Section 5: Teardown ------------------------------------------------------
 

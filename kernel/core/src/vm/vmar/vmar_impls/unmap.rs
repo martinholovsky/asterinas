@@ -23,6 +23,9 @@ impl Vmar {
         }
         inner.vm_mappings.clear();
 
+        // This path does not use `RssDelta`, so release the cgroup charge explicitly.
+        self.uncharge_all_anon_rss();
+
         // Keep `inner` locked to avoid race conditions.
         let preempt_guard = disable_preempt();
         let full_range = 0..VMAR_CAP_ADDR;

@@ -17,7 +17,11 @@ use core::{
 
 use align_ext::AlignExt;
 use aster_util::per_cpu_counter::PerCpuCounter;
-use ostd::{cpu::CpuId, mm::VmSpace};
+use ostd::{
+    cpu::CpuId,
+    mm::VmSpace,
+    sync::{RcuOption, RcuOptionReadGuard},
+};
 
 use super::{
     Rmap, RmapEntry, VMAR_CAP_ADDR, VMAR_LOWEST_ADDR,
@@ -27,6 +31,7 @@ use super::{
     vm_mapping::{MappedMemory, MappedVmo, VmMapping},
 };
 use crate::{
+    fs::cgroupfs::{CgroupNode, charge_memory, uncharge_memory},
     prelude::*,
     process::{INIT_STACK_SIZE, Process, ProcessVm, ResourceType},
     vm::page_cache::Vmo,
@@ -47,6 +52,24 @@ pub(crate) struct Vmar {
     vm_space: Arc<VmSpace>,
     /// The RSS counters
     rss_counters: [PerCpuCounter; NUM_RSS_COUNTERS],
+    /// The cgroup that this VMAR's resident anonymous memory is charged to.
+    ///
+    /// If this field is `None`, the memory is charged to the root cgroup. The binding is
+    /// established when the VMAR is created -- by `fork`, by `execve`, or at process
+    /// creation -- and never changes afterwards, which is what keeps a charge and its
+    /// matching uncharge pointed at the same counter.
+    ///
+    /// This diverges from Linux, which resolves the target memory cgroup at fault time from
+    /// the faulting mm's owner, so that allocations made after a process migrates are charged
+    /// to the new cgroup. Here they continue to be charged to the cgroup the VMAR was born
+    /// in. The two agree on the path that matters for containers -- a runtime places the
+    /// process in the cgroup and then `execve`s, which builds a fresh VMAR against the new
+    /// cgroup -- and disagree when a long-running process is migrated through
+    /// `cgroup.procs`. Charging per page rather than per address space is what would close
+    /// the gap, and it needs a place to put the owner on the frame itself.
+    ///
+    /// Reference: <https://docs.kernel.org/admin-guide/cgroup-v2.html#migration-and-ownership>
+    cgroup: RcuOption<Arc<CgroupNode>>,
     /// The process VM
     process_vm: ProcessVm,
     /// The number of handles that this `Vmar` has (see [`super::VmarHandle`])
@@ -59,7 +82,7 @@ impl Vmar {
     /// Creates a new VMAR.
     ///
     /// This method should only be invoked by [`super::VmarHandle`].
-    pub(super) fn new(process_vm: ProcessVm) -> Arc<Self> {
+    pub(super) fn new(process_vm: ProcessVm, cgroup: Option<Arc<CgroupNode>>) -> Arc<Self> {
         let inner = VmarInner::new();
         let vm_space = VmSpace::new();
         let rss_counters = array::from_fn(|_| PerCpuCounter::new());
@@ -67,6 +90,7 @@ impl Vmar {
             inner: RwMutex::new(inner),
             vm_space: Arc::new(vm_space),
             rss_counters,
+            cgroup: RcuOption::new(cgroup),
             process_vm,
             num_handles: AtomicUsize::new(1),
             weak_self: weak_self.clone(),
@@ -124,6 +148,53 @@ impl Vmar {
         let cpu_id = CpuId::current_racy();
         self.rss_counters[rss_type as usize].add_on_cpu(cpu_id, val);
     }
+
+    /// Returns a RCU read guard to the cgroup that this VMAR's memory is charged to.
+    pub(super) fn cgroup(&self) -> RcuOptionReadGuard<'_, Arc<CgroupNode>> {
+        self.cgroup.read()
+    }
+
+    /// Applies a change in resident anonymous pages to the memory cgroup.
+    ///
+    /// This mirrors [`add_rss_counter`], but the charge lives on the cgroup rather than on
+    /// this VMAR, so it must be released explicitly when the VMAR is torn down. See
+    /// [`uncharge_all_anon_rss`].
+    ///
+    /// [`add_rss_counter`]: Self::add_rss_counter
+    /// [`uncharge_all_anon_rss`]: Self::uncharge_all_anon_rss
+    fn charge_anon_rss(&self, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+
+        // The RCU read guard doubles as the atomic-mode guard for the hierarchy walk, the
+        // same way `charge_cpu_time` uses the process's cgroup guard.
+        let cgroup = self.cgroup.read();
+        if delta > 0 {
+            charge_memory(&cgroup, delta as usize);
+        } else {
+            uncharge_memory(&cgroup, delta.unsigned_abs());
+        }
+    }
+
+    /// Releases the whole anonymous memory charge held by this VMAR.
+    ///
+    /// [`clear`] tears down every mapping at once without going through [`RssDelta`], so the
+    /// per-mapping uncharges never happen. The cgroup counter outlives this VMAR, so without
+    /// this the charge would leak for the lifetime of the cgroup.
+    ///
+    /// [`clear`]: Self::clear
+    pub(super) fn uncharge_all_anon_rss(&self) {
+        let anon_pages = self.get_rss_counter(RssType::Anon);
+        if anon_pages == 0 {
+            return;
+        }
+
+        let cgroup = self.cgroup.read();
+        uncharge_memory(&cgroup, anon_pages);
+        self.rss_counters[RssType::Anon as usize]
+            .add_on_cpu(CpuId::current_racy(), -(anon_pages as isize));
+    }
 }
 
 /// The type representing categories of Resident Set Size (RSS).
@@ -167,6 +238,8 @@ impl Drop for RssDelta<'_> {
             let delta = self.get(rss_type);
             self.operated_vmar.add_rss_counter(rss_type, delta);
         }
+        self.operated_vmar
+            .charge_anon_rss(self.get(RssType::Anon));
     }
 }
 

@@ -26,7 +26,7 @@ use crate::fs::cgroupfs::{
 
 pub(super) mod cpu;
 mod cpuset;
-mod memory;
+pub(super) mod memory;
 mod pids;
 
 /// A trait to abstract all individual cgroup sub-controllers.
@@ -186,9 +186,16 @@ impl<T: SubControlStatic> SubController<T> {
             true
         };
 
-        let inner = if is_active || T::type_() == SubCtrlType::Cpu {
+        let inner = if is_active
+            || T::type_() == SubCtrlType::Cpu
+            || T::type_() == SubCtrlType::Memory
+        {
             // `cpu.stat` exists regardless of whether `+cpu` has been enabled, so the
             // CPU sub-controller must remain instantiated even while inactive.
+            //
+            // The memory sub-controller must remain instantiated for a different reason: a
+            // charge and its matching uncharge are separated in time, so a level that comes
+            // and goes in between would make the uncharge underflow.
             Some(T::new(is_root, is_active))
         } else {
             None
@@ -414,8 +421,21 @@ impl Controller {
                     child_node.controller().cpu.update(Arc::new(new_controller));
                 }
                 SubCtrlType::Memory => {
-                    let new_controller = Arc::new(SubController::new(Some(parent_controller)));
-                    child_node.controller().memory.update(new_controller);
+                    let mut new_controller: SubController<MemoryController> =
+                        SubController::new(Some(parent_controller));
+                    {
+                        let guard = child_node.controller().memory.read();
+                        let previous_controller = guard.get();
+                        new_controller
+                            .inner
+                            .as_mut()
+                            .unwrap()
+                            .init_stats(previous_controller.inner.as_ref().unwrap());
+                    }
+                    child_node
+                        .controller()
+                        .memory
+                        .update(Arc::new(new_controller));
                 }
                 SubCtrlType::Pids => {
                     let mut new_controller: SubController<PidsController> =

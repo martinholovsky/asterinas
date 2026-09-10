@@ -19,7 +19,13 @@ impl Vmar {
         // Obtain the heap lock and hold it for the entire method to avoid race conditions.
         let heap_guard = vmar.process_vm.heap().lock();
 
-        let new_vmar = VmarHandle::new(ProcessVm::fork_from(&vmar.process_vm, &heap_guard));
+        // The child's memory is charged to the same cgroup as the parent's, which is the
+        // cgroup the child starts life in.
+        let cgroup = vmar.cgroup().get().map(|cgroup| cgroup.clone());
+        let new_vmar = VmarHandle::new(
+            ProcessVm::fork_from(&vmar.process_vm, &heap_guard),
+            cgroup,
+        );
 
         {
             let inner = vmar.inner.read();

@@ -3,7 +3,7 @@
 use alloc::sync::{Arc, Weak};
 use core::ops::Deref;
 
-use crate::{process::ProcessVm, vm::vmar::Vmar};
+use crate::{fs::cgroupfs::CgroupNode, process::ProcessVm, vm::vmar::Vmar};
 
 /// A VMAR handle that is owned by a POSIX thread.
 ///
@@ -28,8 +28,11 @@ impl Drop for VmarHandle {
 
 impl VmarHandle {
     /// Creates a new handle that points to a new VMAR.
-    pub(crate) fn new(process_vm: ProcessVm) -> Self {
-        Self(Vmar::new(process_vm))
+    ///
+    /// `cgroup` is the cgroup that the VMAR's anonymous memory is charged to; `None` charges
+    /// it to the root cgroup. It is fixed for the lifetime of the VMAR.
+    pub(crate) fn new(process_vm: ProcessVm, cgroup: Option<Arc<CgroupNode>>) -> Self {
+        Self(Vmar::new(process_vm, cgroup))
     }
 
     /// Clones a new handle.
