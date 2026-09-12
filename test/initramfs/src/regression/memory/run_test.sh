@@ -4,6 +4,7 @@
 
 set -e
 
+./mmap/mmap_32bit
 ./mmap/mmap_and_fork
 ./mmap/mmap_and_mprotect
 ./mmap/mmap_and_mremap
