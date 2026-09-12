@@ -15,6 +15,26 @@
 
 #define TEST_FILE "/tmp/fcntl_owner_regression"
 
+// Reads `F_GETOWN` and undoes glibc's errno translation.
+//
+// glibc turns any raw syscall return in [-4095, -1] into -1 with `errno` set, so a
+// process group owner -- which `F_GETOWN` reports negated -- comes back as an errno
+// rather than as a value. That ambiguity is exactly why `F_GETOWN_EX` exists; here
+// the original return is reconstructed so the negation itself can be asserted.
+static long getown_raw(int fd)
+{
+	long ret;
+
+	errno = 0;
+	ret = syscall(SYS_fcntl, fd, F_GETOWN, 0);
+	if (ret == -1 && errno != 0) {
+		ret = -errno;
+		errno = 0;
+	}
+
+	return ret;
+}
+
 FN_SETUP(create)
 {
 	int fd = CHECK(open(TEST_FILE, O_CREAT | O_RDWR | O_TRUNC, 0666));
@@ -30,11 +50,11 @@ FN_TEST(dup_shares_owner)
 	pid_t pid = TEST_SUCC(getpid());
 
 	TEST_SUCC(fcntl(fd, F_SETOWN, pid));
-	TEST_RES(syscall(SYS_fcntl, duplicated_fd, F_GETOWN, 0), _ret == pid);
-	TEST_RES(syscall(SYS_fcntl, separate_fd, F_GETOWN, 0), _ret == 0);
+	TEST_RES(getown_raw(duplicated_fd), _ret == pid);
+	TEST_RES(getown_raw(separate_fd), _ret == 0);
 
 	TEST_SUCC(fcntl(duplicated_fd, F_SETOWN, 0));
-	TEST_RES(syscall(SYS_fcntl, fd, F_GETOWN, 0), _ret == 0);
+	TEST_RES(getown_raw(fd), _ret == 0);
 
 	TEST_SUCC(close(separate_fd));
 	TEST_SUCC(close(duplicated_fd));
@@ -51,11 +71,11 @@ FN_TEST(setown_accepts_process_group)
 	pid_t pgid = TEST_SUCC(getpgrp());
 
 	TEST_SUCC(fcntl(fd, F_SETOWN, -pgid));
-	TEST_RES(syscall(SYS_fcntl, fd, F_GETOWN, 0), _ret == -pgid);
+	TEST_RES(getown_raw(fd), _ret == -pgid);
 
 	// Setting a process owner afterwards replaces the process group owner.
 	TEST_SUCC(fcntl(fd, F_SETOWN, getpid()));
-	TEST_RES(syscall(SYS_fcntl, fd, F_GETOWN, 0), _ret == getpid());
+	TEST_RES(getown_raw(fd), _ret == getpid());
 
 	TEST_SUCC(close(fd));
 }
@@ -81,10 +101,10 @@ FN_TEST(process_and_group_owners_are_distinct)
 	TEST_SUCC(setpgid(child, child));
 
 	TEST_SUCC(fcntl(fd, F_SETOWN, child));
-	TEST_RES(syscall(SYS_fcntl, fd, F_GETOWN, 0), _ret == child);
+	TEST_RES(getown_raw(fd), _ret == child);
 
 	TEST_SUCC(fcntl(fd, F_SETOWN, -child));
-	TEST_RES(syscall(SYS_fcntl, fd, F_GETOWN, 0), _ret == -child);
+	TEST_RES(getown_raw(fd), _ret == -child);
 
 	TEST_SUCC(kill(child, SIGKILL));
 	TEST_SUCC(waitpid(child, NULL, 0));
@@ -107,7 +127,7 @@ FN_TEST(setown_rejects_unknown_and_out_of_range_ids)
 	TEST_ERRNO(fcntl(fd, F_SETOWN, INT_MIN), EINVAL);
 
 	// A rejected `F_SETOWN` leaves the previous owner untouched.
-	TEST_RES(syscall(SYS_fcntl, fd, F_GETOWN, 0), _ret == 0);
+	TEST_RES(getown_raw(fd), _ret == 0);
 
 	TEST_SUCC(close(fd));
 }
@@ -141,7 +161,7 @@ FN_TEST(setown_ex_round_trips_each_owner_kind)
 
 	// ... while `F_GETOWN` still negates it, which is exactly the ambiguity
 	// `F_GETOWN_EX` exists to resolve.
-	TEST_RES(syscall(SYS_fcntl, fd, F_GETOWN, 0), _ret == -getpgrp());
+	TEST_RES(getown_raw(fd), _ret == -getpgrp());
 
 	owner.type = F_OWNER_TID;
 	owner.pid = syscall(SYS_gettid);
